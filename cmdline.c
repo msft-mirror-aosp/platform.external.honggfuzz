@@ -243,10 +243,8 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
         .threads =
             {
                 .threadsFinished = 0,
-                .threadsMax = ({
-                    long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-                    (ncpus <= 1 ? 1 : ncpus / 2);
-                }),
+                .threadsMax =
+                    (sysconf(_SC_NPROCESSORS_ONLN) <= 1) ? 1 : sysconf(_SC_NPROCESSORS_ONLN) / 2,
                 .threadsActiveCnt = 0,
                 .mainThread = pthread_self(),
                 .mainPid = getpid(),
@@ -274,7 +272,6 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
                 .fuzzStdin = false,
                 .externalCommand = NULL,
                 .postExternalCommand = NULL,
-                .feedbackMutateCommand = NULL,
                 .persistent = false,
                 .netDriver = false,
                 .asLimit = 0U,
@@ -421,7 +418,6 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
         { { "stackhash_bl", required_argument, NULL, 'B' }, "Stackhashes blacklist file (one entry per line)" },
         { { "mutate_cmd", required_argument, NULL, 'c' }, "External command producing fuzz files (instead of internal mutators)" },
         { { "pprocess_cmd", required_argument, NULL, 0x104 }, "External command postprocessing files produced by internal mutators" },
-        { { "ffmutate_cmd", required_argument, NULL, 0x110 }, "External command mutating files which have effective coverage feedback" },
         { { "run_time", required_argument, NULL, 0x109 }, "Number of seconds this fuzzing session will last (default: 0 [no limit])" },
         { { "iterations", required_argument, NULL, 'N' }, "Number of fuzzing iterations (default: 0 [no limit])" },
         { { "rlimit_as", required_argument, NULL, 0x100 }, "Per process RLIMIT_AS in MiB (default: 0 [no limit])" },
@@ -565,12 +561,7 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
                 hfuzz->cfg.reportFile = optarg;
                 break;
             case 'n':
-                if (optarg[0] == 'a') {
-                    long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-                    hfuzz->threads.threadsMax = (ncpus < 1 ? 1 : ncpus);
-                } else {
-                    hfuzz->threads.threadsMax = atol(optarg);
-                }
+                hfuzz->threads.threadsMax = atol(optarg);
                 break;
             case 0x109: {
                 time_t p = atol(optarg);
@@ -595,9 +586,6 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
                 break;
             case 0x104:
                 hfuzz->exe.postExternalCommand = optarg;
-                break;
-            case 0x110:
-                hfuzz->exe.feedbackMutateCommand = optarg;
                 break;
             case 0x105:
                 if ((strcasecmp(optarg, "0") == 0) || (strcasecmp(optarg, "false") == 0)) {

@@ -38,7 +38,7 @@
 #include "libhfcommon/util.h"
 
 #define PROG_NAME "honggfuzz"
-#define PROG_VERSION "1.9"
+#define PROG_VERSION "1.8"
 
 /* Name of the template which will be replaced with the proper name of the file */
 #define _HF_FILE_PLACEHOLDER "___FILE___"
@@ -149,8 +149,7 @@ typedef enum {
     _HF_STATE_UNSET = 0,
     _HF_STATE_STATIC = 1,
     _HF_STATE_DYNAMIC_DRY_RUN = 2,
-    _HF_STATE_DYNAMIC_SWITCH_TO_MAIN = 3,
-    _HF_STATE_DYNAMIC_MAIN = 4,
+    _HF_STATE_DYNAMIC_MAIN = 3,
 } fuzzState_t;
 
 struct dynfile_t {
@@ -207,7 +206,6 @@ typedef struct {
         bool fuzzStdin;
         const char* externalCommand;
         const char* postExternalCommand;
-        const char* feedbackMutateCommand;
         bool netDriver;
         bool persistent;
         uint64_t asLimit;

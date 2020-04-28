@@ -2,6 +2,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "libhfcommon/common.h"
@@ -66,13 +67,13 @@ static inline int HF_strncasecmp(const char* s1, const char* s2, size_t n, uintp
 }
 
 static inline char* HF_strstr(const char* haystack, const char* needle, uintptr_t addr) {
-    size_t needle_len = __builtin_strlen(needle);
+    size_t needle_len = strlen(needle);
     if (needle_len == 0) {
         return (char*)haystack;
     }
 
     const char* h = haystack;
-    for (; (h = __builtin_strchr(h, needle[0])) != NULL; h++) {
+    for (; (h = strchr(h, needle[0])) != NULL; h++) {
         if (HF_strncmp(h, needle, needle_len, addr) == 0) {
             return (char*)h;
         }
@@ -81,7 +82,7 @@ static inline char* HF_strstr(const char* haystack, const char* needle, uintptr_
 }
 
 static inline char* HF_strcasestr(const char* haystack, const char* needle, uintptr_t addr) {
-    size_t needle_len = __builtin_strlen(needle);
+    size_t needle_len = strlen(needle);
     for (size_t i = 0; haystack[i]; i++) {
         if (HF_strncasecmp(&haystack[i], needle, needle_len, addr) == 0) {
             return (char*)(&haystack[i]);
@@ -127,13 +128,10 @@ static inline void* HF_memmem(const void* haystack, size_t haystacklen, const vo
 }
 
 static inline char* HF_strcpy(char* dest, const char* src, uintptr_t addr) {
-    size_t len = __builtin_strlen(src);
-    if (len > 0) {
-        uint32_t level = (sizeof(len) * 8) - __builtin_clzl(len);
-        instrumentUpdateCmpMap(addr, level);
-    }
+    size_t len = strlen(src);
 
-    return __builtin_memcpy(dest, src, len + 1);
+    instrumentUpdateCmpMap(addr, len);
+    return memcpy(dest, src, len + 1);
 }
 
 /* Define a weak function x, as well as __wrap_x pointing to x */
