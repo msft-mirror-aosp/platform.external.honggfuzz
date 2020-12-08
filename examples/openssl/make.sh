@@ -13,7 +13,7 @@ CXX="$HFUZZ_SRC/hfuzz_cc/hfuzz-clang++"
 COMMON_FLAGS="-DBORINGSSL_UNSAFE_DETERMINISTIC_MODE -DBORINGSSL_UNSAFE_FUZZER_MODE -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -DBN_DEBUG -DLIBRESSL_HAS_TLS1_3 \
 	-O3 -g -DFuzzerInitialize=LLVMFuzzerInitialize -DFuzzerTestOneInput=LLVMFuzzerTestOneInput \
 	-I./$DIR/include -I$HFUZZ_SRC/examples/openssl -I$HFUZZ_SRC"
-COMMON_LDFLAGS="-lpthread -lz -Wl,-z,now"
+COMMON_LDFLAGS="-lpthread -lz"
 
 if [ -z "$DIR" ]; then
 	echo "$0" DIR SANITIZE
@@ -42,14 +42,22 @@ if [ -n "$SAN" ]; then
 	SAN=".$SAN"
 fi
 
+echo "Building honggfuzz fuzzers"
 for x in x509 privkey client server; do
 	$CC $COMMON_FLAGS -g "$HFUZZ_SRC/examples/openssl/$x.c" -o "$TYPE$SAN.$x$SUFFIX" "$LIBSSL" "$LIBCRYPTO" $COMMON_LDFLAGS $SAN_COMPILE
 done
 
+# We only need the part above, the rest is for debugging
+if [ -z "$DEBUG" ]; then
+	exit 0
+fi
+
+echo "Building fuzzers which accept input from stdin - for special purposes only"
 for x in x509 privkey client server; do
 	$CC $COMMON_FLAGS -DHF_SSL_FROM_STDIN -g "$HFUZZ_SRC/examples/openssl/$x.c" -o "stdin.$TYPE$SAN.$x" "$LIBSSL" "$LIBCRYPTO" $COMMON_LDFLAGS $SAN_COMPILE
 done
 
+echo "Building libFuzzer fuzzers"
 for x in x509 privkey client server; do
 	clang++ $COMMON_FLAGS -g "$HFUZZ_SRC/examples/openssl/$x.c" -o "libfuzzer.$TYPE$SAN.$x$SUFFIX" "$LIBSSL" "$LIBCRYPTO" $COMMON_LDFLAGS $SAN_COMPILE -lFuzzer
 done

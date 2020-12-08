@@ -9,11 +9,11 @@ third_party {
     type: GIT
     value: "https://github.com/google/honggfuzz"
   }
-  version: "1.9"
+  version: "2.3"
   license_type: NOTICE
   last_upgrade_date {
-    year: 2019
-    month: 5
-    day: 22
+    year: 2020
+    month: 11
+    day: 23
   }
 }
