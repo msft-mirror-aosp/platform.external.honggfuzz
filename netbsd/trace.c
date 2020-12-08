@@ -32,6 +32,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -56,7 +57,8 @@
 #include "libhfcommon/log.h"
 #include "libhfcommon/util.h"
 #include "netbsd/unwind.h"
-#include "socketfuzzer.h"
+#include "report.h"
+#include "sanitizers.h"
 #include "subproc.h"
 
 #include <capstone/capstone.h>
@@ -79,57 +81,79 @@
 #define MAX_INSTR_SZ 8
 #endif
 
+/*
+ * Keep in sync the important signals with the PT_SET_SIGPASS call.
+ */
 static struct {
     const char* descr;
-    bool important;
+    bool        important;
 } arch_sigs[_NSIG + 1] = {
     [0 ...(_NSIG)].important = false,
-    [0 ...(_NSIG)].descr = "UNKNOWN",
+    [0 ...(_NSIG)].descr     = "UNKNOWN",
 
     [SIGTRAP].important = false,
-    [SIGTRAP].descr = "SIGTRAP",
+    [SIGTRAP].descr     = "SIGTRAP",
 
     [SIGILL].important = true,
-    [SIGILL].descr = "SIGILL",
+    [SIGILL].descr     = "SIGILL",
 
     [SIGFPE].important = true,
-    [SIGFPE].descr = "SIGFPE",
+    [SIGFPE].descr     = "SIGFPE",
 
     [SIGSEGV].important = true,
-    [SIGSEGV].descr = "SIGSEGV",
+    [SIGSEGV].descr     = "SIGSEGV",
 
     [SIGBUS].important = true,
-    [SIGBUS].descr = "SIGBUS",
+    [SIGBUS].descr     = "SIGBUS",
 
-    /* Is affected from monitorSIGABRT flag */
-    [SIGABRT].important = false,
-    [SIGABRT].descr = "SIGABRT",
+    [SIGABRT].important = true,
+    [SIGABRT].descr     = "SIGABRT",
 
     /* Is affected from tmoutVTALRM flag */
     [SIGVTALRM].important = false,
-    [SIGVTALRM].descr = "SIGVTALRM-TMOUT",
+    [SIGVTALRM].descr     = "SIGVTALRM-TMOUT",
 
     /* seccomp-bpf kill */
     [SIGSYS].important = true,
-    [SIGSYS].descr = "SIGSYS",
+    [SIGSYS].descr     = "SIGSYS",
 };
 
 #ifndef SI_FROMUSER
 #define SI_FROMUSER(siptr) ((siptr)->si_code == SI_USER)
 #endif /* SI_FROMUSER */
 
-static __thread char arch_signame[32];
-static const char* arch_sigName(int signo) {
-    snprintf(arch_signame, sizeof(arch_signame), "SIG%s", signalname(signo));
-    return arch_signame;
+/*
+ * Check whether VA0 page is mappable into the process address space.
+ */
+static bool get_user_va0_disable(void) {
+    static int user_va0_disable     = -1;
+    size_t     user_va0_disable_len = sizeof(user_va0_disable);
+
+    if (user_va0_disable == -1) {
+        if (sysctlbyname(
+                "vm.user_va0_disable", &user_va0_disable, &user_va0_disable_len, NULL, 0) == -1) {
+            return true;
+        }
+    }
+
+    if (user_va0_disable > 0)
+        return true;
+    else
+        return false;
 }
 
 static size_t arch_getProcMem(pid_t pid, uint8_t* buf, size_t len, register_t pc) {
     struct ptrace_io_desc io;
-    size_t bytes_read;
+    size_t                bytes_read;
 
-    bytes_read = 0;
-    io.piod_op = PIOD_READ_D;
+    /*
+     * Check whether the 0x0 virtual address is always invalid, if so
+     * an attempt of reading from its address will return EINVAL.
+     */
+    if (pc == 0 && get_user_va0_disable() == true) return 0;
+
+    bytes_read  = 0;
+    io.piod_op  = PIOD_READ_D;
     io.piod_len = len;
 
     do {
@@ -143,7 +167,7 @@ static size_t arch_getProcMem(pid_t pid, uint8_t* buf, size_t len, register_t pc
             break;
         }
 
-        bytes_read = io.piod_len;
+        bytes_read  = io.piod_len;
         io.piod_len = len - bytes_read;
     } while (bytes_read < len);
 
@@ -175,8 +199,8 @@ static void arch_getInstrStr(pid_t pid, lwpid_t lwp, register_t* pc, char* instr
      * We need a value aligned to 8
      * which is sizeof(long) on 64bit CPU archs (on most of them, I hope;)
      */
-    uint8_t buf[MAX_INSTR_SZ];
-    size_t memsz;
+    uint8_t    buf[MAX_INSTR_SZ];
+    size_t     memsz;
     register_t status_reg = 0;
 
     snprintf(instr, _HF_INSTR_SZ, "%s", "[UNKNOWN]");
@@ -199,13 +223,13 @@ static void arch_getInstrStr(pid_t pid, lwpid_t lwp, register_t* pc, char* instr
     arch = CS_ARCH_X86;
     mode = CS_MODE_32;
 #elif defined(__x86_64__)
-    arch = CS_ARCH_X86;
-    mode = CS_MODE_64;
+    arch        = CS_ARCH_X86;
+    mode        = CS_MODE_64;
 #else
 #error Unsupported CPU architecture
 #endif
 
-    csh handle;
+    csh    handle;
     cs_err err = cs_open(arch, mode, &handle);
     if (err != CS_ERR_OK) {
         LOG_W("Capstone initialization failed: '%s'", cs_strerror(err));
@@ -213,7 +237,7 @@ static void arch_getInstrStr(pid_t pid, lwpid_t lwp, register_t* pc, char* instr
     }
 
     cs_insn* insn;
-    size_t count = cs_disasm(handle, buf, sizeof(buf), *pc, 0, &insn);
+    size_t   count = cs_disasm(handle, buf, sizeof(buf), *pc, 0, &insn);
 
     if (count < 1) {
         LOG_W("Couldn't disassemble the assembler instructions' stream: '%s'",
@@ -236,59 +260,9 @@ static void arch_getInstrStr(pid_t pid, lwpid_t lwp, register_t* pc, char* instr
     return;
 }
 
-static void arch_hashCallstack(
-    run_t* run, funcs_t* funcs HF_ATTR_UNUSED, size_t funcCnt, bool enableMasking) {
-    uint64_t hash = 0;
-    for (size_t i = 0; i < funcCnt && i < run->global->netbsd.numMajorFrames; i++) {
-        /*
-         * Convert PC to char array to be compatible with hash function
-         */
-        char pcStr[REGSIZEINCHAR] = {0};
-        snprintf(pcStr, REGSIZEINCHAR, "%" PRIxREGISTER, (register_t)(long)funcs[i].pc);
-
-        /*
-         * Hash the last three nibbles
-         */
-        hash ^= util_hash(&pcStr[strlen(pcStr) - 3], 3);
-    }
-
-    /*
-     * If only one frame, hash is not safe to be used for uniqueness. We mask it
-     * here with a constant prefix, so analyzers can pick it up and create filenames
-     * accordingly. 'enableMasking' is controlling masking for cases where it should
-     * not be enabled (e.g. fuzzer worker is from verifier).
-     */
-    if (enableMasking && funcCnt == 1) {
-        hash |= _HF_SINGLE_FRAME_MASK;
-    }
-    run->backtrace = hash;
-}
-
-static void arch_traceGenerateReport(
-    pid_t pid, run_t* run, funcs_t* funcs, size_t funcCnt, siginfo_t* si, const char* instr) {
-    run->report[0] = '\0';
-    util_ssnprintf(run->report, sizeof(run->report), "ORIG_FNAME: %s\n", run->origFileName);
-    util_ssnprintf(run->report, sizeof(run->report), "FUZZ_FNAME: %s\n", run->crashFileName);
-    util_ssnprintf(run->report, sizeof(run->report), "PID: %d\n", pid);
-    util_ssnprintf(run->report, sizeof(run->report), "SIGNAL: %s (%d)\n",
-        arch_sigName(si->si_signo), si->si_signo);
-    util_ssnprintf(run->report, sizeof(run->report), "FAULT ADDRESS: %p\n",
-        SI_FROMUSER(si) ? NULL : si->si_addr);
-    util_ssnprintf(run->report, sizeof(run->report), "INSTRUCTION: %s\n", instr);
-    util_ssnprintf(
-        run->report, sizeof(run->report), "STACK HASH: %016" PRIx64 "\n", run->backtrace);
-    util_ssnprintf(run->report, sizeof(run->report), "STACK:\n");
-    for (size_t i = 0; i < funcCnt; i++) {
-        util_ssnprintf(run->report, sizeof(run->report), " <%" PRIxREGISTER "> [%s():%zu at %s]\n",
-            (register_t)(long)funcs[i].pc, funcs[i].func, funcs[i].line, funcs[i].mapName);
-    }
-
-    return;
-}
-
 static void arch_traceAnalyzeData(run_t* run, pid_t pid) {
     ptrace_siginfo_t info;
-    register_t pc = 0, status_reg = 0;
+    register_t       pc = 0, status_reg = 0;
 
     if (ptrace(PT_GET_SIGINFO, pid, &info, sizeof(info)) == -1) {
         PLOG_W("Couldn't get siginfo for pid %d", pid);
@@ -318,7 +292,7 @@ static void arch_traceAnalyzeData(run_t* run, pid_t pid) {
     if (pc) {
         /* Manually update major frame PC & frames counter */
         funcs[0].pc = (void*)(uintptr_t)pc;
-        funcCnt = 1;
+        funcCnt     = 1;
     } else {
         return;
     }
@@ -326,7 +300,7 @@ static void arch_traceAnalyzeData(run_t* run, pid_t pid) {
     /*
      * Calculate backtrace callstack hash signature
      */
-    arch_hashCallstack(run, funcs, funcCnt, false);
+    run->backtrace = sanitizers_hashCallstack(run, funcs, funcCnt, false);
 }
 
 static void arch_traceSaveData(run_t* run, pid_t pid) {
@@ -335,7 +309,7 @@ static void arch_traceSaveData(run_t* run, pid_t pid) {
     /* Local copy since flag is overridden for some crashes */
     bool saveUnique = run->global->io.saveUnique;
 
-    char instr[_HF_INSTR_SZ] = "\x00";
+    char                  instr[_HF_INSTR_SZ] = "\x00";
     struct ptrace_siginfo info;
     memset(&info, 0, sizeof(info));
 
@@ -345,15 +319,19 @@ static void arch_traceSaveData(run_t* run, pid_t pid) {
 
     arch_getInstrStr(pid, info.psi_lwpid, &pc, instr);
 
+    void* sig_addr = info.psi_siginfo.si_addr;
+    /* User-induced signals don't set si.si_addr */
+    if (SI_FROMUSER(&info.psi_siginfo)) {
+        sig_addr = NULL;
+    }
+
     LOG_D("Pid: %d, signo: %d, errno: %d, code: %d, addr: %p, pc: %" PRIxREGISTER ", instr: '%s'",
         pid, info.psi_siginfo.si_signo, info.psi_siginfo.si_errno, info.psi_siginfo.si_code,
-        info.psi_siginfo.si_addr, pc, instr);
+        sig_addr, pc, instr);
 
-    if (!SI_FROMUSER(&info.psi_siginfo) && pc &&
-        info.psi_siginfo.si_addr < run->global->netbsd.ignoreAddr) {
+    if (!SI_FROMUSER(&info.psi_siginfo) && pc && sig_addr < run->global->arch_netbsd.ignoreAddr) {
         LOG_I("Input is interesting (%s), but the si.si_addr is %p (below %p), skipping",
-            arch_sigName(info.psi_siginfo.si_signo), info.psi_siginfo.si_addr,
-            run->global->netbsd.ignoreAddr);
+            util_sigName(info.psi_siginfo.si_signo), sig_addr, run->global->arch_netbsd.ignoreAddr);
         return;
     }
 
@@ -376,7 +354,7 @@ static void arch_traceSaveData(run_t* run, pid_t pid) {
     if (pc) {
         /* Manually update major frame PC & frames counter */
         funcs[0].pc = (void*)(uintptr_t)pc;
-        funcCnt = 1;
+        funcCnt     = 1;
     } else {
         saveUnique = false;
     }
@@ -390,7 +368,7 @@ static void arch_traceSaveData(run_t* run, pid_t pid) {
     /*
      * Calculate backtrace callstack hash signature
      */
-    arch_hashCallstack(run, funcs, funcCnt, saveUnique);
+    run->backtrace = sanitizers_hashCallstack(run, funcs, funcCnt, saveUnique);
 
     /*
      * If unique flag is set and single frame crash, disable uniqueness for this crash
@@ -425,9 +403,9 @@ static void arch_traceSaveData(run_t* run, pid_t pid) {
      * both stackhash and symbol blacklist. Crash is always kept regardless
      * of the status of uniqueness flag.
      */
-    if (run->global->netbsd.symsWl) {
+    if (run->global->arch_netbsd.symsWl) {
         char* wlSymbol = arch_btContainsSymbol(
-            run->global->netbsd.symsWlCnt, run->global->netbsd.symsWl, funcCnt, funcs);
+            run->global->arch_netbsd.symsWlCnt, run->global->arch_netbsd.symsWl, funcCnt, funcs);
         if (wlSymbol != NULL) {
             saveUnique = false;
             LOG_D("Whitelisted symbol '%s' found, skipping blacklist checks", wlSymbol);
@@ -448,7 +426,7 @@ static void arch_traceSaveData(run_t* run, pid_t pid) {
          * Check if backtrace contains blacklisted symbol
          */
         char* blSymbol = arch_btContainsSymbol(
-            run->global->netbsd.symsBlCnt, run->global->netbsd.symsBl, funcCnt, funcs);
+            run->global->arch_netbsd.symsBlCnt, run->global->arch_netbsd.symsBl, funcCnt, funcs);
         if (blSymbol != NULL) {
             LOG_I("Blacklisted symbol '%s' found, skipping", blSymbol);
             ATOMIC_POST_INC(run->global->cnts.blCrashesCnt);
@@ -459,36 +437,22 @@ static void arch_traceSaveData(run_t* run, pid_t pid) {
     /* If non-blacklisted crash detected, zero set two MSB */
     ATOMIC_POST_ADD(run->global->cfg.dynFileIterExpire, _HF_DYNFILE_SUB_MASK);
 
-    void* sig_addr = info.psi_siginfo.si_addr;
-    pc = 0UL;
-    sig_addr = NULL;
-
-    /* User-induced signals don't set si.si_addr */
-    if (SI_FROMUSER(&info.psi_siginfo)) {
-        sig_addr = NULL;
-    }
-
     /* If dry run mode, copy file with same name into workspace */
     if (run->global->mutate.mutationsPerRun == 0U && run->global->cfg.useVerifier) {
         snprintf(run->crashFileName, sizeof(run->crashFileName), "%s/%s", run->global->io.crashDir,
-            run->origFileName);
+            run->dynfile->path);
     } else if (saveUnique) {
         snprintf(run->crashFileName, sizeof(run->crashFileName),
             "%s/%s.PC.%" PRIxREGISTER ".STACK.%" PRIx64 ".CODE.%d.ADDR.%p.INSTR.%s.%s",
-            run->global->io.crashDir, arch_sigName(info.psi_siginfo.si_signo), pc, run->backtrace,
+            run->global->io.crashDir, util_sigName(info.psi_siginfo.si_signo), pc, run->backtrace,
             info.psi_siginfo.si_code, sig_addr, instr, run->global->io.fileExtn);
     } else {
         char localtmstr[PATH_MAX];
         util_getLocalTime("%F.%H:%M:%S", localtmstr, sizeof(localtmstr), time(NULL));
         snprintf(run->crashFileName, sizeof(run->crashFileName),
             "%s/%s.PC.%" PRIxREGISTER ".STACK.%" PRIx64 ".CODE.%d.ADDR.%p.INSTR.%s.%s.%d.%s",
-            run->global->io.crashDir, arch_sigName(info.psi_siginfo.si_signo), pc, run->backtrace,
+            run->global->io.crashDir, util_sigName(info.psi_siginfo.si_signo), pc, run->backtrace,
             info.psi_siginfo.si_code, sig_addr, instr, localtmstr, pid, run->global->io.fileExtn);
-    }
-
-    /* Target crashed (no duplicate detection yet) */
-    if (run->global->socketFuzzer.enabled) {
-        LOG_D("SocketFuzzer: trace: Crash Identified");
     }
 
     if (files_exists(run->crashFileName)) {
@@ -498,30 +462,26 @@ static void arch_traceSaveData(run_t* run, pid_t pid) {
         return;
     }
 
-    if (!files_writeBufToFile(run->crashFileName, run->dynamicFile, run->dynamicFileSz,
+    if (!files_writeBufToFile(run->crashFileName, run->dynfile->data, run->dynfile->size,
             O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC)) {
         LOG_E("Couldn't write to '%s'", run->crashFileName);
         return;
     }
 
-    /* Unique new crash, notify fuzzer */
-    if (run->global->socketFuzzer.enabled) {
-        LOG_D("SocketFuzzer: trace: New Uniqu Crash");
-        fuzz_notifySocketFuzzerCrash(run);
-    }
     LOG_I("Crash: saved as '%s'", run->crashFileName);
 
     ATOMIC_POST_INC(run->global->cnts.uniqueCrashesCnt);
     /* If unique crash found, reset dynFile counter */
     ATOMIC_CLEAR(run->global->cfg.dynFileIterExpire);
 
-    arch_traceGenerateReport(pid, run, funcs, funcCnt, &info.psi_siginfo, instr);
+    report_appendReport(pid, run, funcs, funcCnt, pc, (uint64_t)info.psi_siginfo.si_addr,
+        info.psi_siginfo.si_signo, instr, "");
 }
 
 static void arch_traceEvent(run_t* run HF_ATTR_UNUSED, pid_t pid) {
-    ptrace_state_t state;
+    ptrace_state_t   state;
     ptrace_siginfo_t info;
-    int sig = 0;
+    int              sig = 0;
 
     if (ptrace(PT_GET_SIGINFO, pid, &info, sizeof(info)) == -1) {
         PLOG_E("ptrace(PT_GET_SIGINFO, pid=%d)", (int)pid);
@@ -542,7 +502,7 @@ static void arch_traceEvent(run_t* run HF_ATTR_UNUSED, pid_t pid) {
                 break;
             case TRAP_CHLD:
             case TRAP_LWP:
-                /* Child/LWP trap, ignore */
+                /* Child/LWP trap, unused */
                 if (ptrace(PT_GET_PROCESS_STATE, pid, &state, sizeof(state)) != -1) {
                     switch (state.pe_report_event) {
                         case PTRACE_FORK:
@@ -555,6 +515,11 @@ static void arch_traceEvent(run_t* run HF_ATTR_UNUSED, pid_t pid) {
                             LOG_D("PID: %d child trap (TRAP_CHLD) : vfork (PTRACE_VFORK_DONE)",
                                 (int)pid);
                             break;
+#ifdef PTRACE_POSIX_SPAWN
+                        case PTRACE_POSIX_SPAWN:
+                            LOG_D("PID: %d child trap (TRAP_CHLD) : spawn (POSIX_SPAWN)", (int)pid);
+                            break;
+#endif
                         case PTRACE_LWP_CREATE:
                             LOG_E("PID: %d unexpected lwp trap (TRAP_LWP) : create "
                                   "(PTRACE_LWP_CREATE)",
@@ -649,7 +614,7 @@ bool arch_traceWaitForPidStop(pid_t pid) {
     LOG_D("Waiting for pid=%d to stop", (int)pid);
 
     for (;;) {
-        int status;
+        int   status;
         pid_t ret = wait4(pid, &status, __WALL | WUNTRACED | WTRAPPED, NULL);
         if (ret == -1 && errno == EINTR) {
             continue;
@@ -680,17 +645,25 @@ bool arch_traceAttach(run_t* run) {
         return false;
     }
 
-    ptrace_event_t event = {
-        /*
-         * NetBSD 8.0 seems to support PTRACE_FORK only:
-         *          .pe_set_event = PTRACE_FORK | PTRACE_VFORK | PTRACE_VFORK_DONE,
-         */
-        .pe_set_event = PTRACE_FORK,
-    };
-    if (ptrace(PT_SET_EVENT_MASK, run->pid, &event, sizeof(event)) == -1) {
-        PLOG_W("Couldn't ptrace(PT_SET_EVENT_MASK) to pid: %d", (int)run->pid);
+#ifdef PT_SET_SIGPASS
+    /*
+     * Don't intercept uninteresting signals.
+     *
+     * Note that crash signals (SIGSEGV, SIGILL, SIGFPE, SIGBUS, SIGTRAP) for
+     * real crashes (thus not including: kill(2), raise(2) etc) are never passed
+     * over and are always directed to the debugger.
+     *
+     * Keep in sync with struct arch_sigs[].
+     */
+    sigset_t set;
+    sigfillset(&set);
+    sigdelset(&set, SIGABRT);
+    sigdelset(&set, SIGSYS);
+    if (ptrace(PT_SET_SIGPASS, run->pid, &set, sizeof(set)) == -1) {
+        PLOG_W("Couldn't ptrace(PT_SET_SIGPASS) to pid: %d", (int)run->pid);
         return false;
     }
+#endif
 
     LOG_D("Attached to PID: %d", run->pid);
 
@@ -709,9 +682,6 @@ void arch_traceDetach(pid_t pid) {
 }
 
 void arch_traceSignalsInit(honggfuzz_t* hfuzz) {
-    /* Default is true for all platforms except Android */
-    arch_sigs[SIGABRT].important = hfuzz->cfg.monitorSIGABRT;
-
     /* Default is false */
     arch_sigs[SIGVTALRM].important = hfuzz->timing.tmoutVTALRM;
 }
