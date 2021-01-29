@@ -28,10 +28,7 @@
 
 #include "honggfuzz.h"
 
-#define _HF_DYNFILE_SUB_MASK 0xFFFUL  // Zero-set two MSB
-
-/* Constant prefix used for single frame crashes stackhash masking */
-#define _HF_SINGLE_FRAME_MASK 0xBADBAD0000000000
+#define _HF_DYNFILE_SUB_MASK 0xFFFUL    // Zero-set two MSB
 
 extern bool arch_traceWaitForPidStop(pid_t pid);
 extern bool arch_traceEnable(run_t* run);

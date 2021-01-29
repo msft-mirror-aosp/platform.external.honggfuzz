@@ -11,7 +11,6 @@ cc_defaults {
         "-Wall",
         "-Wno-initializer-overrides",
         "-Werror",
-        "-Wframe-larger-than=131072",
         "-D__HF_USES_CAPSTONE__",
         "-D_HF_ARCH_LINUX",
     ],
