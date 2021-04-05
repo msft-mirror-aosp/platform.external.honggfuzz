@@ -1,2 +1,3 @@
-mspector@google.com
-hamzeh@google.com
+# This project have been removed. See go/android-3p if you want to bring this
+# project back --- doing so will count as a new import from this perspective.
+include platform/system/core:/janitors/OWNERS
